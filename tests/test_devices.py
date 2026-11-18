@@ -791,11 +791,32 @@ def _frame_decrypting_to(conn: BHyveBleConnection, pt: bytes, ctr: int) -> bytes
 
 
 def test_ctr_selfheal_on_bad_first_frame():
-    # A garbage first frame (bad inner header) is a real CTR desync → self-heal.
+    # A garbage first frame (bad inner header) with no reply after it is a real CTR
+    # desync. It is judged once the reply is in (_settle_exchange, under the lock),
+    # never by a disconnect scheduled from the notify callback, which would cut the
+    # write in flight.
     conn, hass = _handshaken_conn()
+    conn._client = _FakeClient(23)
     frame = _frame_decrypting_to(conn, b"\xd0\x18\x29\x07deadbeef", 0)
     conn._on_notify(None, frame)
-    assert len(hass.jobs) == 1  # disconnect scheduled
+    assert hass.jobs == []  # nothing scheduled from the callback
+    asyncio.run(conn._settle_exchange())
+    assert conn._client is None and not conn._handshaken  # the session was closed
+
+
+def test_the_tail_of_a_straddling_burst_does_not_close_the_session():
+    # A WT25G2's connect-time #16 push can straddle the pre-write reset: its first
+    # frame is dropped with the reset and its ASCII-timestamp tail arrives first in
+    # the next exchange. That decrypts fine; it is not a desync. Once the real reply
+    # arrives with its header, the session stands.
+    conn, hass = _handshaken_conn(reply_header=_WT_BURST[0][:4])
+    conn._client = _FakeClient(23)
+    for pt in (_WT_BURST[2], _WT_BURST[3]):          # the tail of an earlier burst
+        conn._on_notify(None, _frame_decrypting_to(conn, pt, conn._rx_ctr))
+    for pt in _WT_BURST:                             # this exchange's own reply
+        conn._on_notify(None, _frame_decrypting_to(conn, pt, conn._rx_ctr))
+    asyncio.run(conn._settle_exchange())
+    assert hass.jobs == [] and conn._client is not None and conn._handshaken
 
 
 def test_ctr_selfheal_ignores_bad_continuation_frame():
@@ -1100,9 +1121,17 @@ def test_match_advertised_returns_none_rather_than_guessing():
 # --- MTU: this hardware refuses ATT long writes -------------------------------------
 
 class _FakeClient:
+    is_connected = True
+
     def __init__(self, mtu):
         self.mtu_size = mtu
         self.written = []
+
+    async def disconnect(self):
+        pass
+
+    async def stop_notify(self, *_a):
+        pass
 
     async def write_gatt_char(self, _uuid, data, response=True):
         self.written.append(bytes(data))
@@ -1219,7 +1248,8 @@ def test_a_truncated_reply_does_not_outlive_its_exchange():
     assert c._assembly == bytearray(), \
         f"a truncated reply outlived its exchange ({len(c._assembly)}B left)"
     deliver(b"\xde\xad\xbe\xef" + b"\x00" * 12)
-    assert scheduled, "the stray frame was absorbed instead of tripping the self-heal"
+    assert c._assembly == bytearray() and c._exchange_stray == 1, \
+        "the stray frame was absorbed instead of counted for the self-heal"
 
 
 def test_a_failed_split_write_closes_the_session():
@@ -1361,7 +1391,7 @@ def test_open_falls_back_to_the_advertised_name_and_caches_it(monkeypatch):
                             {"44:67:55:1A:1B:2C": device})
     reached = {}
 
-    async def _stop_at_connect(cls, ble_device, name, max_attempts=3):
+    async def _stop_at_connect(cls, ble_device, name, max_attempts=3, **_kwargs):
         reached["device"] = ble_device
         raise RuntimeError("far enough")
 
@@ -1435,7 +1465,8 @@ def test_a_desync_drops_a_resolved_address():
     trailer = (sum(pt) + c._trailer_const + len(pt)) & 0xFFFF
     c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
                                  + struct.pack("<H", trailer)))
-    assert scheduled, "the desync self-heal did not fire"
+    asyncio.run(c._settle_exchange())
+    assert c._client is None, "the desync self-heal did not fire"
     assert c._ble_address is None, "a resolved address survived the self-heal"
 
 
@@ -1603,3 +1634,59 @@ def test_reassembled_status_actually_parses():
     rx.apply_status_plaintext(dev, whole)
     assert dev._status_parsed is True
     assert dev.state.is_watering is False
+
+
+# --- held session (keep_connected / keep_alive) ------------------------------
+
+def test_only_the_mains_powered_controller_keeps_its_session():
+    """The battery valves hold ONE session and pay for every connected minute, so only
+    the WT25G2 keeps the link open between operations."""
+    from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
+    assert BHyveWT25G2Device.keep_connected is True
+    assert BHyveProtobufDevice.keep_connected is False
+
+
+def test_end_session_keeps_a_live_link_only_for_keep_connected():
+    for keep, survives in ((True, True), (False, False)):
+        dev = types.SimpleNamespace(keep_connected=keep, connection=_conn(23))
+        from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
+        asyncio.run(BHyveProtobufDevice._end_session(dev))
+        assert (dev.connection._client is not None) is survives
+
+
+def test_a_held_session_is_never_closed_for_idleness():
+    c = _conn(23)
+    c._idle_sec = 60
+    c.keep_alive = True
+    c._arm_idle_timer()
+    assert c._idle_timer is None
+
+
+def test_a_lost_link_marks_only_its_own_session_dead():
+    c = _conn(23)
+    c._handshaken, c._session_gen = True, 2
+    c._on_link_lost(1)                       # a callback from an earlier link
+    assert c._handshaken
+    c._on_link_lost(2)
+    assert not c._handshaken
+
+
+def test_a_dead_held_link_is_reopened_once_and_the_exchange_rerun(monkeypatch):
+    from bleak.exc import BleakError
+    c = _conn(23)
+    c._handshaken = True
+    opened, runs = [], []
+
+    async def ensure_connected():
+        if not c._handshaken:
+            c._client, c._handshaken = _FakeClient(23), True
+            opened.append(1)
+    monkeypatch.setattr(c, "ensure_connected", ensure_connected)
+
+    async def exchange():
+        runs.append(1)
+        if len(runs) == 1:
+            raise BleakError("Not connected")
+        return "reply"
+    assert asyncio.run(c._on_live_session(exchange)) == "reply"
+    assert len(opened) == 1 and len(runs) == 2

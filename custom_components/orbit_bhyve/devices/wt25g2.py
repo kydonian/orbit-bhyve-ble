@@ -40,3 +40,12 @@ class BHyveWT25G2Device(BHyveProtobufDevice):
     """Multi-station sprinkler controller (fw0096), protobuf protocol family."""
 
     log_label = "WT25G2"
+    # Mains-powered, so a held session costs nothing, and each reconnect costs a
+    # connect plus handshake through the proxy (several seconds) and opens the
+    # window in which the connect-time status push can straddle the handshake.
+    keep_connected = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.connection is not None:
+            self.connection.keep_alive = True
