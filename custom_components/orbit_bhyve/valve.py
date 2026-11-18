@@ -94,8 +94,18 @@ class BHyveZoneValve(CoordinatorEntity[BHyveDeviceCoordinator], ValveEntity):
             or self._default_duration
         )
         if await self.coordinator.device.start_watering(self._station, duration):
-            await self.coordinator.async_request_refresh()
+            self._publish_confirmed_state()
 
     async def async_close_valve(self, **kwargs: Any) -> None:
         if await self.coordinator.device.stop_watering(self._station):
-            await self.coordinator.async_request_refresh()
+            self._publish_confirmed_state()
+
+    def _publish_confirmed_state(self) -> None:
+        """Show the state the command just confirmed from the device's own status reply.
+
+        Not async_request_refresh(): its debouncer returns at once within 10 s of the
+        last poll and updates the entities only when its cooldown ends, so the call
+        returned with the old state (closed after a start, watering after a stop);
+        outside the cooldown it re-polls the device, program dump included, adding
+        ~7 s to the call. The command already read the real run state."""
+        self.coordinator.async_set_updated_data(self.coordinator.device.state)
