@@ -166,6 +166,17 @@ class BHyveBleConnection:
         # initial subscribe. See hold_open()/release().
         self._held = False
         self._hold_expiry: asyncio.TimerHandle | None = None
+        # Never close the session for idleness: set by a device class whose link
+        # should stay up between operations (a mains-powered controller).
+        self.keep_alive = False
+        # Bumped on every open, so a disconnect callback from an earlier link
+        # can't mark the current one down.
+        self._session_gen = 0
+        # Per exchange (reset by _reset_rx): first frames that carried the reply
+        # header, and frames that were neither a header nor a continuation of one.
+        # _settle_exchange judges the CTR stream from these once the reply is in.
+        self._exchange_headers = 0
+        self._exchange_stray = 0
 
     @property
     def is_held(self) -> bool:
@@ -198,6 +209,10 @@ class BHyveBleConnection:
         exclusive access; idempotent otherwise."""
         if self.is_connected and self._handshaken:
             return
+        if self._client is not None:
+            # A held link that dropped (or whose session was invalidated) leaves
+            # a client behind; close it so the open below starts clean.
+            await self.disconnect()
         # _open() already retries OPEN_MAX_ATTEMPTS times internally; don't wrap
         # it in a second retry loop or the attempts multiply (3x3=9 handshakes,
         # ~90-150s on a stalling device). One call = one bounded retry budget.
@@ -244,8 +259,11 @@ class BHyveBleConnection:
         for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
             try:
                 _LOGGER.debug("%s: connecting (attempt %d/%d)", self.mac, attempt, OPEN_MAX_ATTEMPTS)
+                self._session_gen += 1
+                gen = self._session_gen
                 self._client = await establish_connection(
-                    BleakClient, ble_device, self.mac, max_attempts=3
+                    BleakClient, ble_device, self.mac, max_attempts=3,
+                    disconnected_callback=lambda _client, gen=gen: self._on_link_lost(gen),
                 )
                 _LOGGER.debug("%s: connected", self.mac)
                 if self._gatt_settle_ms > 0:
@@ -270,6 +288,15 @@ class BHyveBleConnection:
         raise BleHandshakeError(
             f"{self.mac}: open failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
         )
+
+    def _on_link_lost(self, gen: int) -> None:
+        """Bleak's disconnect callback. Mark the session dead so the next
+        operation reopens instead of writing into a link that is gone; over a
+        proxy, is_connected can otherwise lag the real link state."""
+        if gen != self._session_gen:
+            return
+        _LOGGER.debug("%s: link lost", self.mac)
+        self._handshaken = False
 
     async def _handshake(self) -> None:
         """Subscribe + AES handshake. Bounded by a timeout in _open() because
@@ -314,6 +341,8 @@ class BHyveBleConnection:
         self._notif_buf.clear()
         self._notif_pt.clear()
         self._assembly = bytearray()
+        self._exchange_headers = 0
+        self._exchange_stray = 0
 
     def _on_notify(self, _sender, data) -> None:
         """Bleak notification callback. Buffers the raw frame for the
@@ -365,29 +394,26 @@ class BHyveBleConnection:
                 # short-reply devices behave exactly as before.
                 if len(pt) >= 4 and pt[:4] == self._reply_header:
                     self._assembly = bytearray(pt)
+                    self._exchange_headers += 1
                 elif self._assembly:
                     self._assembly.extend(pt)
                 else:
-                    # Neither a first frame nor a continuation of one: the branch
-                    # above takes every frame that arrives while a reply is in
-                    # flight, and a frame too short to hold a header never gets
-                    # here, so what reaches this point has a BAD header and no
-                    # assembly to belong to. _notif_buf is cleared before each write, so
-                    # len<=1 means it is the first frame of this exchange — a real
-                    # CTR desync, worth tearing the session down to re-base the
-                    # counter. Later than that, it is stray or a mid-stream desync
-                    # we recover on the next reply, so leave the session alone.
-                    if len(self._notif_buf) <= 1:
-                        _LOGGER.warning(
-                            "%s: CTR desync detected (bad header %s) — scheduling disconnect to self-heal",
-                            self.mac, pt[:4].hex(),
-                        )
-                        # Drop any address resolved by advertised name. A desync is
-                        # also what a WRONG device looks like — the handshake cannot
-                        # tell them apart, since it never consults the key — and a
-                        # cached wrong address would send every retry back to it.
-                        self._ble_address = None
-                        self.hass.add_job(self.disconnect)
+                    # Neither a first frame nor a continuation of one. This is NOT
+                    # proof of a CTR desync: the tail of a burst whose first frame
+                    # landed before the last _reset_rx (a status push straddling
+                    # the handshake or an exchange boundary, or a reply that
+                    # outlasted the drain's quiet window) decrypts correctly and
+                    # still lands here. On a WT25G2 these "bad headers" decode as
+                    # the ASCII timestamps of a #16 burst (":46-", "2026"). The
+                    # old response, an unlocked disconnect scheduled from here,
+                    # cut the link under the write in flight and failed it.
+                    # Count it instead; _settle_exchange decides once the reply
+                    # is in, under the lock.
+                    self._exchange_stray += 1
+                    _LOGGER.debug(
+                        "%s: frame with no reply header and no reply in flight (%s) — "
+                        "ignored", self.mac, pt[:4].hex(),
+                    )
                     return
 
                 # pt[4] declares the byte count from the length field to the CRC, so
@@ -489,7 +515,7 @@ class BHyveBleConnection:
         self._arm_idle_timer()
 
     def _arm_idle_timer(self) -> None:
-        if self._held:
+        if self._held or self.keep_alive:
             return
         if self._idle_sec <= 0:
             return
@@ -639,6 +665,38 @@ class BHyveBleConnection:
             except asyncio.TimeoutError:
                 return  # no new frame within the window -> reply complete (or silent)
 
+    async def _settle_exchange(self) -> None:
+        """Judge the CTR stream once a reply is in, and close the session if it
+        is broken. Caller holds self._lock and has already copied out the reply.
+
+        Every protobuf command is answered by at least one inner message, so a
+        drain that collected frames but not one reply header means the RX
+        keystream no longer lines up (a dropped or re-delivered frame) — or the
+        address resolved by advertised name is a different B-Hyve: the handshake
+        never consults the key, so a wrong device answers it too, and its replies
+        fail the header check. A drain that collected nothing means the command
+        may not have landed, which leaves the TX counter ahead of the device's.
+        Either way a fresh handshake re-bases both counters. Closing here, under
+        the lock and after the drain, never cuts a write in flight."""
+        if self._reply_header is None or not self.is_connected:
+            return
+        if self._exchange_headers:
+            return
+        if self._exchange_stray:
+            _LOGGER.warning(
+                "%s: CTR desync detected (%d frame(s), none with the reply header) — "
+                "reconnecting", self.mac, self._exchange_stray,
+            )
+            # Don't come back to an address that may belong to another device.
+            self._ble_address = None
+        elif self.keep_alive:
+            # Only a held session outlives the operation, so only there can a
+            # silently skewed TX counter poison later commands.
+            _LOGGER.debug("%s: no reply — reconnecting to re-base the counters", self.mac)
+        else:
+            return
+        await self.disconnect()
+
     async def _write_and_drain(self, plaintext: bytes, drain_ms: int) -> list[bytes]:
         """Write a command and collect its reply. Caller MUST hold self._lock and
         have an established, initialised session."""
@@ -646,16 +704,39 @@ class BHyveBleConnection:
         await self._write_locked(plaintext)
         await self._drain(drain_ms)
         received = list(self._notif_buf)
+        await self._settle_exchange()
         self._reset_rx()
         self._arm_idle_timer()
         return received
+
+    async def _on_live_session(self, exchange: Callable[[], Awaitable]):
+        """Run one exchange, reopening once if a pooled link turns out dead.
+
+        A held session can have died without its disconnect callback firing yet
+        (over a proxy the link state lags), so its first write fails with
+        BleakError. Reopen and run the exchange once more on the fresh session.
+        A cold open already got its own retries in _open, so its errors stand.
+        The retry resends the command: a start the device did take restarts the
+        same station's run, and every other command here is idempotent."""
+        pooled = self.is_connected and self._handshaken
+        await self.ensure_connected()
+        try:
+            return await exchange()
+        except BleakError as err:
+            if not pooled:
+                raise
+            _LOGGER.debug("%s: held link was dead (%s) — reopening once", self.mac, err)
+            await self.disconnect()
+            await self.ensure_connected()
+            return await exchange()
 
     async def send(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
         """Encrypt + WRITE_REQ + drain notifications until the reply goes quiet
         (bounded by `drain_ms`). Returns the raw notification frames received."""
         async with self._lock:
-            await self.ensure_connected()
-            return await self._write_and_drain(plaintext, drain_ms)
+            return await self._on_live_session(
+                lambda: self._write_and_drain(plaintext, drain_ms)
+            )
 
     async def send_stream(self, plaintext: bytes, *, drain_ms: int = 4000) -> bytes:
         """Send a request and return the concatenated decrypted plaintext of the
@@ -668,15 +749,18 @@ class BHyveBleConnection:
         original stream; the caller (status.split_inner_messages / parse_sync_dump)
         scans it for the aa775a0f-headed inner messages. Single-frame fast paths
         (#16/#30/#59) are untouched — they still flow through send()/the observer."""
-        async with self._lock:
-            await self.ensure_connected()
+        async def exchange() -> bytes:
             self._reset_rx()
             await self._write_locked(plaintext)
             await self._drain(drain_ms)
             stream = b"".join(self._notif_pt)
+            await self._settle_exchange()
             self._reset_rx()
             self._arm_idle_timer()
             return stream
+
+        async with self._lock:
+            return await self._on_live_session(exchange)
 
     async def send_raw(self, plaintext: bytes) -> None:
         """Encrypt + WRITE_REQ with no notification drain. For init-step
@@ -721,6 +805,7 @@ class BHyveBleConnection:
             await self._write_locked(plaintext)
             await self._drain(drain_ms)
             received = list(self._notif_buf)
+            await self._settle_exchange()
             self._reset_rx()
             self._arm_idle_timer()
             return received
