@@ -1407,3 +1407,42 @@ def test_valve_close_and_open_raise_on_failure():
     with pytest.raises(HomeAssistantError, match="START not confirmed"):
         asyncio.run(valve.async_open_valve(duration=120))
     assert calls["refresh"] == 0
+
+
+def test_valve_open_and_close_show_the_confirmed_state_without_a_refresh():
+    # A confirmed start/stop publishes device.state at once. A refresh instead
+    # would return before the entities update (debounced) or re-poll the device.
+    pytest.importorskip("homeassistant")
+    from types import SimpleNamespace
+    from orbit_bhyve.valve import BHyveZoneValve
+
+    published, refreshes = [], []
+
+    async def refresh():
+        refreshes.append(1)
+
+    class _Dev:
+        name, mac, log_label = "Garden", "AA:BB:CC:DD:EE:FF", "WT25G2"
+        stations = 1
+        state = SimpleNamespace(is_watering=False)
+
+        async def start_watering(self, station, duration):
+            self.state.is_watering = True
+            return True
+
+        async def stop_watering(self, station=None):
+            self.state.is_watering = False
+            return True
+
+    valve = object.__new__(BHyveZoneValve)
+    valve.coordinator = SimpleNamespace(
+        device=_Dev(), async_request_refresh=refresh, preferred_duration_sec=None,
+        async_set_updated_data=lambda data: published.append(data.is_watering),
+    )
+    valve._station = 1
+    valve._default_duration = 600
+
+    asyncio.run(valve.async_open_valve(duration=120))
+    asyncio.run(valve.async_close_valve())
+    assert published == [True, False]
+    assert refreshes == []

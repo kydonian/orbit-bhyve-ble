@@ -105,7 +105,7 @@ class BHyveZoneValve(CoordinatorEntity[BHyveDeviceCoordinator], ValveEntity):
                 f"{device.name} ({device.mac} {getattr(device, 'log_label', '')}): "
                 "START not confirmed by the device"
             )
-        await self.coordinator.async_request_refresh()
+        self._show_confirmed_state()
 
     async def async_close_valve(self, **kwargs: Any) -> None:
         device = self.coordinator.device
@@ -114,4 +114,16 @@ class BHyveZoneValve(CoordinatorEntity[BHyveDeviceCoordinator], ValveEntity):
             raise HomeAssistantError(
                 f"{device.name} ({device.mac} {getattr(device, 'log_label', '')}): {reason}"
             )
-        await self.coordinator.async_request_refresh()
+        self._show_confirmed_state()
+
+    def _show_confirmed_state(self) -> None:
+        """Show the run state the command just confirmed from the device.
+
+        Not async_request_refresh(): within its 10 s cooldown the debouncer
+        returns at once and updates entities only when the cooldown ends, so the
+        service call returned with the old state (closed after a start, watering
+        after a stop); outside it, it re-polled the device before returning,
+        adding seconds to every call. start_watering/stop_watering already set
+        the confirmed state on device.state.
+        """
+        self.coordinator.async_set_updated_data(self.coordinator.device.state)
