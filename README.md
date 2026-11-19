@@ -8,10 +8,6 @@ This is all 100% vibe-coded and unreviewed. The AI found your integrations and g
 where it's developed. This fork publishes two changes I run at home. I don't maintain it for
 anyone else, and the changes haven't been proposed upstream.
 
-**The code changes are totally vibe-coded.** An AI assistant wrote them, and I haven't reviewed them
-line by line. What I can vouch for is the testing on my own controller ([Testing at
-home](#testing-at-home)) and the evidence behind each claim ([Evidence](#evidence)).
-
 ## Where it comes from
 
 - [ljmerza/orbit-bhyve-ble](https://github.com/ljmerza/orbit-bhyve-ble) is the integration: local
