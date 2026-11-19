@@ -791,11 +791,32 @@ def _frame_decrypting_to(conn: BHyveBleConnection, pt: bytes, ctr: int) -> bytes
 
 
 def test_ctr_selfheal_on_bad_first_frame():
-    # A garbage first frame (bad inner header) is a real CTR desync → self-heal.
+    # A garbage first frame (bad inner header) with no reply after it is a real CTR
+    # desync. It is judged once the reply is in (_settle_exchange, under the lock),
+    # never by a disconnect scheduled from the notify callback, which would cut the
+    # write in flight.
     conn, hass = _handshaken_conn()
+    conn._client = _FakeClient(23)
     frame = _frame_decrypting_to(conn, b"\xd0\x18\x29\x07deadbeef", 0)
     conn._on_notify(None, frame)
-    assert len(hass.jobs) == 1  # disconnect scheduled
+    assert hass.jobs == []  # nothing scheduled from the callback
+    asyncio.run(conn._settle_exchange())
+    assert conn._client is None and not conn._handshaken  # the session was closed
+
+
+def test_the_tail_of_a_straddling_burst_does_not_close_the_session():
+    # A WT25G2's connect-time #16 push can straddle the pre-write reset: its first
+    # frame is dropped with the reset and its ASCII-timestamp tail arrives first in
+    # the next exchange. That decrypts fine; it is not a desync. Once the real reply
+    # arrives with its header, the session stands.
+    conn, hass = _handshaken_conn(reply_header=_WT_BURST[0][:4])
+    conn._client = _FakeClient(23)
+    for pt in (_WT_BURST[2], _WT_BURST[3]):          # the tail of an earlier burst
+        conn._on_notify(None, _frame_decrypting_to(conn, pt, conn._rx_ctr))
+    for pt in _WT_BURST:                             # this exchange's own reply
+        conn._on_notify(None, _frame_decrypting_to(conn, pt, conn._rx_ctr))
+    asyncio.run(conn._settle_exchange())
+    assert hass.jobs == [] and conn._client is not None and conn._handshaken
 
 
 def test_ctr_selfheal_ignores_bad_continuation_frame():
@@ -1100,9 +1121,17 @@ def test_match_advertised_returns_none_rather_than_guessing():
 # --- MTU: this hardware refuses ATT long writes -------------------------------------
 
 class _FakeClient:
+    is_connected = True
+
     def __init__(self, mtu):
         self.mtu_size = mtu
         self.written = []
+
+    async def disconnect(self):
+        pass
+
+    async def stop_notify(self, *_a):
+        pass
 
     async def write_gatt_char(self, _uuid, data, response=True):
         self.written.append(bytes(data))
@@ -1219,7 +1248,8 @@ def test_a_truncated_reply_does_not_outlive_its_exchange():
     assert c._assembly == bytearray(), \
         f"a truncated reply outlived its exchange ({len(c._assembly)}B left)"
     deliver(b"\xde\xad\xbe\xef" + b"\x00" * 12)
-    assert scheduled, "the stray frame was absorbed instead of tripping the self-heal"
+    assert c._assembly == bytearray() and c._exchange_stray == 1, \
+        "the stray frame was absorbed instead of counted for the self-heal"
 
 
 def test_a_failed_split_write_closes_the_session():
@@ -1435,7 +1465,8 @@ def test_a_desync_drops_a_resolved_address():
     trailer = (sum(pt) + c._trailer_const + len(pt)) & 0xFFFF
     c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
                                  + struct.pack("<H", trailer)))
-    assert scheduled, "the desync self-heal did not fire"
+    asyncio.run(c._settle_exchange())
+    assert c._client is None, "the desync self-heal did not fire"
     assert c._ble_address is None, "a resolved address survived the self-heal"
 
 
@@ -1603,3 +1634,4 @@ def test_reassembled_status_actually_parses():
     rx.apply_status_plaintext(dev, whole)
     assert dev._status_parsed is True
     assert dev.state.is_watering is False
+

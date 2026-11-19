@@ -166,6 +166,11 @@ class BHyveBleConnection:
         # initial subscribe. See hold_open()/release().
         self._held = False
         self._hold_expiry: asyncio.TimerHandle | None = None
+        # Per exchange (reset by _reset_rx): first frames that carried the reply
+        # header, and frames that were neither a header nor a continuation of one.
+        # _settle_exchange judges the CTR stream from these once the reply is in.
+        self._exchange_headers = 0
+        self._exchange_stray = 0
 
     @property
     def is_held(self) -> bool:
@@ -314,6 +319,8 @@ class BHyveBleConnection:
         self._notif_buf.clear()
         self._notif_pt.clear()
         self._assembly = bytearray()
+        self._exchange_headers = 0
+        self._exchange_stray = 0
 
     def _on_notify(self, _sender, data) -> None:
         """Bleak notification callback. Buffers the raw frame for the
@@ -365,29 +372,26 @@ class BHyveBleConnection:
                 # short-reply devices behave exactly as before.
                 if len(pt) >= 4 and pt[:4] == self._reply_header:
                     self._assembly = bytearray(pt)
+                    self._exchange_headers += 1
                 elif self._assembly:
                     self._assembly.extend(pt)
                 else:
-                    # Neither a first frame nor a continuation of one: the branch
-                    # above takes every frame that arrives while a reply is in
-                    # flight, and a frame too short to hold a header never gets
-                    # here, so what reaches this point has a BAD header and no
-                    # assembly to belong to. _notif_buf is cleared before each write, so
-                    # len<=1 means it is the first frame of this exchange — a real
-                    # CTR desync, worth tearing the session down to re-base the
-                    # counter. Later than that, it is stray or a mid-stream desync
-                    # we recover on the next reply, so leave the session alone.
-                    if len(self._notif_buf) <= 1:
-                        _LOGGER.warning(
-                            "%s: CTR desync detected (bad header %s) — scheduling disconnect to self-heal",
-                            self.mac, pt[:4].hex(),
-                        )
-                        # Drop any address resolved by advertised name. A desync is
-                        # also what a WRONG device looks like — the handshake cannot
-                        # tell them apart, since it never consults the key — and a
-                        # cached wrong address would send every retry back to it.
-                        self._ble_address = None
-                        self.hass.add_job(self.disconnect)
+                    # Neither a first frame nor a continuation of one. This is NOT
+                    # proof of a CTR desync: the tail of a burst whose first frame
+                    # landed before the last _reset_rx (a status push straddling
+                    # the handshake or an exchange boundary, or a reply that
+                    # outlasted the drain's quiet window) decrypts correctly and
+                    # still lands here. On a WT25G2 these "bad headers" decode as
+                    # the ASCII timestamps of a #16 burst (":46-", "2026"). The
+                    # old response, an unlocked disconnect scheduled from here,
+                    # cut the link under the write in flight and failed it.
+                    # Count it instead; _settle_exchange decides once the reply
+                    # is in, under the lock.
+                    self._exchange_stray += 1
+                    _LOGGER.debug(
+                        "%s: frame with no reply header and no reply in flight (%s) — "
+                        "ignored", self.mac, pt[:4].hex(),
+                    )
                     return
 
                 # pt[4] declares the byte count from the length field to the CRC, so
@@ -639,6 +643,29 @@ class BHyveBleConnection:
             except asyncio.TimeoutError:
                 return  # no new frame within the window -> reply complete (or silent)
 
+    async def _settle_exchange(self) -> None:
+        """Judge the CTR stream once a reply is in, and close the session if it
+        is broken. Caller holds self._lock and has already copied out the reply.
+
+        Every protobuf command is answered by at least one inner message, so a
+        drain that collected frames but not one reply header means the RX
+        keystream no longer lines up (a dropped or re-delivered frame) — or the
+        address resolved by advertised name is a different B-Hyve: the handshake
+        never consults the key, so a wrong device answers it too, and its replies
+        fail the header check. A fresh handshake re-bases both counters. Closing
+        here, under the lock and after the drain, never cuts a write in flight."""
+        if self._reply_header is None or not self.is_connected:
+            return
+        if self._exchange_headers or not self._exchange_stray:
+            return
+        _LOGGER.warning(
+            "%s: CTR desync detected (%d frame(s), none with the reply header) — "
+            "reconnecting", self.mac, self._exchange_stray,
+        )
+        # Don't come back to an address that may belong to another device.
+        self._ble_address = None
+        await self.disconnect()
+
     async def _write_and_drain(self, plaintext: bytes, drain_ms: int) -> list[bytes]:
         """Write a command and collect its reply. Caller MUST hold self._lock and
         have an established, initialised session."""
@@ -646,6 +673,7 @@ class BHyveBleConnection:
         await self._write_locked(plaintext)
         await self._drain(drain_ms)
         received = list(self._notif_buf)
+        await self._settle_exchange()
         self._reset_rx()
         self._arm_idle_timer()
         return received
@@ -674,6 +702,7 @@ class BHyveBleConnection:
             await self._write_locked(plaintext)
             await self._drain(drain_ms)
             stream = b"".join(self._notif_pt)
+            await self._settle_exchange()
             self._reset_rx()
             self._arm_idle_timer()
             return stream
@@ -721,6 +750,7 @@ class BHyveBleConnection:
             await self._write_locked(plaintext)
             await self._drain(drain_ms)
             received = list(self._notif_buf)
+            await self._settle_exchange()
             self._reset_rx()
             self._arm_idle_timer()
             return received
