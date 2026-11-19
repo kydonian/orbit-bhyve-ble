@@ -395,7 +395,10 @@ def _register_services(hass: HomeAssistant) -> None:
                 if coord.device.connection is None:
                     continue
                 try:
-                    await coord.device.stop_watering()
+                    if await coord.device.stop_watering():
+                        # The stop confirmed idle from the device's status; show it now
+                        # rather than at the next poll (valve.py, _publish_confirmed_state).
+                        coord.async_set_updated_data(coord.device.state)
                 except Exception as err:
                     _LOGGER.warning("stop_all on %s: %s", coord.device.name, err)
 
