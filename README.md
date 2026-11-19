@@ -1,293 +1,205 @@
-> **This is a fork of [ljmerza/orbit-bhyve-ble](https://github.com/ljmerza/orbit-bhyve-ble).** It adds the WT25 sprinkler controller as a supported device (WT25G2 verified against the hardware) and three fixes in the BLE connection layer: replies spanning several notifications are reassembled before parsing, an outgoing message longer than one ATT write is split across frames sized from the negotiated MTU, since the device refuses the ATT long write that would otherwise carry it, and a device whose cloud record carries its Wi-Fi MAC has its BLE address resolved rather than failing to connect.
-> Read branch **`wt25g2`**; `main` mirrors upstream unchanged.
-> Changes meant for upstream are prepared as patch series against `main`.
->
-> **The README below is upstream's**, with this fork's changes folded in where they apply.
-> Its install and image instructions point at upstream and will not give you the changes
-> above. To run this fork: `git clone -b wt25g2 https://github.com/pete-jorgensen/orbit-bhyve-ble.git`.
-# Orbit B-Hyve BLE — Home Assistant integration
+# Authors note
 
-<p align="center">
-<img src="https://img.shields.io/github/stars/ljmerza/orbit-bhyve-ble?style=for-the-badge&label=Stars&color=orange" alt="Stars">
-<a href="https://github.com/ljmerza/orbit-bhyve-ble/releases"><img src="https://img.shields.io/github/downloads/ljmerza/orbit-bhyve-ble/total?style=for-the-badge&label=Downloads&color=blue" alt="Downloads"></a>
-<a href="https://github.com/ljmerza/orbit-bhyve-ble/releases/latest"><img src="https://img.shields.io/github/v/release/ljmerza/orbit-bhyve-ble?style=for-the-badge&color=purple" alt="Version"></a>
-<a href="https://github.com/ljmerza/orbit-bhyve-ble/actions/workflows/release.yaml"><img src="https://img.shields.io/github/actions/workflow/status/ljmerza/orbit-bhyve-ble/release.yaml?style=for-the-badge&label=Build" alt="Build"></a>
-<a href="https://github.com/ljmerza/orbit-bhyve-ble/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ljmerza/orbit-bhyve-ble?style=for-the-badge&label=License&color=green" alt="License"></a>
-</p>
+This is all 100% vibe-coded and unreviewed. The AI found your integrations and got it working on my hardware, I told it to record anything that might be helpful to the original author's. Presented for what it is, just in case it's useful.
 
-<p align="center">
-<a href="https://www.buymeacoffee.com/JMISm06AD"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
-</p>
+# orbit-bhyve-ble, for the B-hyve WT25G2 sprinkler controller
 
-**Local BLE control for Orbit B-Hyve hose-tap and XD timers.** Cloud is
-contacted only at setup to discover devices and fetch network keys. After
-setup, every command and state poll is BLE-only — your timers keep working
-when the WAN goes down.
+**The integration's documentation is at [ljmerza/orbit-bhyve-ble](https://github.com/ljmerza/orbit-bhyve-ble)**,
+where it's developed. This fork publishes two changes I run at home. I don't maintain it for
+anyone else, and the changes haven't been proposed upstream.
 
-## Supported hardware
+## Where it comes from
 
-| Family            | Hardware       | Firmware tested | Status                                  |
-|-------------------|----------------|------------------|------------------------------------------|
-| Hose-tap timer    | `HT25-0000`    | `0085`           | ✅ Actuated end-to-end                   |
-| Hose-tap timer    | `HT25-0000`    | `0041`           | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
-| Hose-tap timer (Gen2) | `HT25G2-0001` | `0111`          | ✅ Actuated end-to-end (protobuf protocol) |
-| Hose-tap timer (Gen2, 90205Z) | `HT25A-0001` | `0098`  | ✅ Actuated end-to-end on hardware, plus programs (A–D) and rain delay / next run; flow-sensor readings not yet confirmed on this variant |
-| 4-port XD         | `HT34A-0001`   | `0107`           | ✅ Battery/status decode verified on hardware; XD actuation proven via HT32A sibling |
-| 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
-| 2-port XD         | `HT32A-0001`   | `0107`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
-| Hose-tap timer    | `HT31-0001`    | `0058`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
-| Sprinkler controller (mains, multi-station) | `WT25G2-0001` | `0096` | ✅ Actuated end-to-end on 12 stations. A DIFFERENT product line from the `HT` hose timers despite the model string; shares their protobuf protocol, and station count flows from the cloud record |
+- [ljmerza/orbit-bhyve-ble](https://github.com/ljmerza/orbit-bhyve-ble) is the integration: local
+  Bluetooth control of Orbit B-hyve timers in Home Assistant.
+- [pete-jorgensen/orbit-bhyve-ble](https://github.com/pete-jorgensen/orbit-bhyve-ble) adds the
+  WT25G2 sprinkler controller, on its `wt25g2` branch. That work isn't in ljmerza's repo yet
+  ([E1](#e1-wt25g2-support-isnt-upstream)).
+- This fork is pete-jorgensen's `wt25g2` (at `d1e861e`) plus the two changes below, on branch
+  `wt25g2`.
 
-> ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
-> reverse-engineered against the firmware versions above. A firmware update
-> may change the encryption protocol or trailer algorithm. If the official
-> B-Hyve app prompts you to update, decline.
+## Why it exists
 
-## Install via HACS (recommended)
+My WT25G2 worked with pete-jorgensen's branch, but it was slow and unreliable:
+- **Slow:** starts took 5.5–28.9 s and stops 7.9–24.3 s ([E2](#e2-command-times)).
+- **Failing:** 5 of 23 starts failed outright, each at the moment the integration logged a "CTR
+  desync" ([E3](#e3-the-desync-check-fired-on-good-frames-and-broke-commands)).
+- **Stale:** Home Assistant kept showing a valve's old state for up to 10 s after a command had
+  worked ([E4](#e4-the-valve-state-lagged-by-up-to-10-s)).
 
-1. **HACS → Integrations → ⋮ menu → Custom repositories**
-2. URL: `https://github.com/ljmerza/orbit-bhyve-ble` — Category: **Integration**
-3. Click **Install** on **Orbit B-Hyve BLE**
-4. Restart Home Assistant
-5. **Settings → Devices & Services → Add Integration → "Orbit B-Hyve BLE"**
-6. Enter your Orbit cloud email + password — the integration discovers all
-   devices on the account and fetches each one's BLE network key
+Two changes fix that:
 
-## Manual install
+1. **The controller stays connected.**
+   - The integration used to connect, do its encrypted handshake and disconnect for every command
+     ([E5](#e5-a-connection-per-command)).
+   - Its check for a garbled connection ("CTR desync") also fired on status messages that were
+     fine, and its disconnect broke the command being sent
+     ([E3](#e3-the-desync-check-fired-on-good-frames-and-broke-commands)).
+   - Now the WT25G2, which is mains-powered, keeps its connection, and the check reconnects only
+     when a reply really is garbled. The battery timers still connect per command
+     ([E6](#e6-only-the-wt25g2-keeps-its-connection)).
+2. **A valve shows its new state as soon as the command returns**, for open, close and
+   `stop_all` ([E4](#e4-the-valve-state-lagged-by-up-to-10-s)).
 
-1. Copy `custom_components/orbit_bhyve/` into `<config>/custom_components/`
-2. Restart HA
-3. **Settings → Devices & Services → Add Integration → "Orbit B-Hyve BLE"**
+Before and after, measured the same way (the script's own log of each Home Assistant service call):
 
-## What you get
+| | Before | After |
+|---|---|---|
+| A start takes | 5.5–28.9 s; 5 of 23 failed | 2.1–2.2 s; 0 of 8 failed |
+| A stop takes | 7.9–24.3 s | 3.5–4.2 s |
+| The valve state when the call returns | Old in 5 of 7 calls | Current in 4 of 4 |
+| "CTR desync" warnings in Home Assistant's log | 108 in 3 days | None since |
 
-Per discovered sprinkler device:
+## Testing at home
 
-- **Valve** per physical station (HT25 = 1, HT34A/HT34 = up to 4) — uses
-  `valve.open_valve` / `valve.close_valve`. Open/closed state is
-  **optimistic** (derived from the last command, not from a decoded
-  device status).
-- **Battery (%)** sensor — live, BLE-sourced. Decoded from the device's
-  info-ack frame on every poll, no cloud round-trip after setup. The percent
-  is a linear voltage gauge whose discharge curve is chosen by the **Battery
-  chemistry** selector below.
-- **Battery voltage (mV)** sensor — same source as the percent sensor;
-  disabled by default, enable it from the entity's settings if you want
-  the raw reading.
-- **Battery chemistry** (`select`, config category) — the AA cell chemistry
-  you installed (**Alkaline** / **Ni-MH rechargeable** / **Lithium primary**
-  / **Lithium regulated 1.5 V**), which selects the voltage→percent curve.
-  Chemistry can't be auto-detected from a single voltage reading (2550 mV
-  could be alkaline at 25% or Ni-MH at 80%), so it defaults to Alkaline
-  (Orbit's stock assumption) and you set it per device; changing it re-gauges
-  the percent immediately, no device round-trip. **Note:** regulated 1.5 V
-  Li-Ion cells output a constant voltage until they abruptly cut off, so no
-  percentage gauge can track them — the percent reads full right up until the
-  valve dies. Watch the voltage sensor instead.
-- **Signal strength (RSSI)** sensor — the BLE advertisement RSSI from
-  Home Assistant's bluetooth manager (works even while disconnected);
-  disabled by default.
-- **Connected** and **Watering** binary sensors — device connectivity
-  (diagnostic) and whether a station is currently running, for automations
-  and dashboards.
-- **Problem** binary sensor (protobuf family) — the device's own fault
-  report: pump, battery, voltage-boost, flow anomalies and per-station
-  faults, with each flag as an attribute. On flow-capable Gen2 valves two
-  dedicated sensors ride along: **Leak detected** (water moving while the
-  valve is commanded closed) and **No flow** (valve open but nothing
-  flowing; disabled by default until field-confirmed — you can test it by
-  starting a run with the faucet closed).
-- **Default watering duration** (`number` entity, minutes) — per device.
-  The valve uses this when `start_watering` is called without an
-  explicit duration. Restored across HA restarts.
-- **Sync** button per device — forces a fresh BLE connect + init
-  handshake. Useful after a long idle, or to refresh the battery
-  reading on demand without waiting for the next poll.
-- **Mesh live status** (HT25, opt-in option) — by default mesh timers are
-  polled passively (state comes from command acks + a wall-clock timer, to
-  spare the AA batteries). Turning on **Mesh live status poll** makes each
-  idle poll connect and read the device's real watering state, countdown
-  and battery — so runs started from the B-Hyve app or a hub schedule show
-  up in HA within one poll. Costs roughly 96 BLE connects/day at the
-  default 15-minute cadence.
-- **Identify** button (protobuf family) — flashes the device LED (#47)
-  so you can physically locate it. No-op on the XD, which ignores it.
-- **Automatic watering** switch — the device-global controller mode
-  (auto vs. off). When off, stored programs don't run.
-- **Program A–D** enable switches + summary sensors — each stored
-  program slot's on/off enable bit, plus a sensor showing its schedule
-  (days, start times, per-zone durations). A slot with no stored program
-  reads `unavailable`.
-- **Next run** sensor — the device-computed next scheduled program start
-  (timestamp), with the program letter(s) as an attribute.
-- **Flow rate** and **Water used** sensors (flow-capable Gen2 valves) —
-  instantaneous GPM sampled from the inline flow sensor on each watering
-  poll, plus a cumulative gallons total integrated from it that plugs
-  straight into HA's Water dashboard (no Integration helper needed; the
-  total is restored across restarts). Calibrate with the **Flow
-  calibration** option below. A diagnostic **Flow rate (device)** sensor
-  (disabled by default) records the device's own reported GPM field to
-  confirm whether it ever populates.
-- **Flow rate** and **Water used** sensors (HT25 fw0085, opt-in) — litres per
-  minute and a per-run litre total, decoded from the timer's own inline flow
-  meter over an undocumented BLE subscription. The total is a per-run counter,
-  so `TOTAL_INCREASING` treats each run as a meter reset and HA's long-term
-  statistics book clean deltas; it plugs into the Water dashboard without an
-  Integration helper. Both sensors read `unavailable` until **Flow
-  measurement** is switched on for that device.
-- **Flow measurement** (`switch`, config category, HT25) — per-device opt-in,
-  **off by default**, and worth understanding before you turn it on.
-  Measuring holds the timer's single BLE session open for the whole program
-  and re-subscribes every 240 s, because the device stops sampling about 300
-  seconds after each subscription no matter how many samples were requested.
-  That is more radio-on time than the **Mesh live status poll** below, and
-  while the session is held the B-hyve app and any status poll are locked out
-  of that timer. Flipping the switch sends nothing over BLE — it only decides
-  whether the *next* run subscribes; turning it off mid-run stops measuring
-  immediately and hands the connection back.
-- **Flow calibration** (`number`, counts per litre, config category, HT25) —
-  per-device, restored across restarts. The meter reports raw tick counts and
-  this converts them to litres, so it is specific to your plumbing. Four HT25
-  fw0085 units calibrated against the vendor app measured **113–118**; the
-  default of 112 therefore over-reports slightly until you set yours. To
-  calibrate, run the same duration twice on one tap — once from the B-hyve app
-  and once from Home Assistant — then
-  `new = current × (HA litres ÷ app litres)`. Run them back to back so mains
-  pressure doesn't drift, and use a long enough run (10 minutes is ample) that
-  single-tick resolution is negligible. The number stays settable while Flow
-  measurement is off, so a known value can be entered before the first
-  measured run.
+The setup:
+- One WT25G2-0001 (firmware 0096).
+- An ESPHome Bluetooth proxy (ESP32-S3, ESPHome 2026.10.2) and Home Assistant 2026.11.1.
+- The water off throughout. Times are Pacific.
 
-  > **Only runs started through Home Assistant are measured**, including the
-  > `orbit_bhyve.start_watering` service. The subscription is issued as part
-  > of the start sequence, so a run triggered from the timer's physical button
-  > or from the B-hyve app produces no flow data.
-- Manufacturer / model / firmware / MAC are exposed via the device's
-  "Device info" panel.
-- **Download diagnostics** — the integration and each device support HA's
-  standard diagnostics download (Settings → Devices & Services → ⋮ →
-  Download diagnostics): device records, live state and poll health, with
-  credentials and BLE network keys redacted. Attach it to bug reports.
+What I ran:
+1. **Before**, on pete-jorgensen's code: my blowout script's runs, 2026-11-17 21:33–21:59 and
+   2026-11-18 10:54–12:19 ([E2](#e2-command-times)).
+2. **12:24, change 1 deployed.**
+3. **12:30–12:37, timing test:** 7 cycles of start, wait 10 s, close, fresh read, across zones
+   1–3. The last two came after 90 s idle, longer than the old 60 s idle disconnect.
+   - The integration's debug log shows no reconnects.
+   - The kind of status frame that used to trip the desync check was logged as "ignored", and
+     decrypted to a timestamp ([E3](#e3-the-desync-check-fired-on-good-frames-and-broke-commands)).
+   - Home Assistant showed the old valve state in 5 of 7 cycles, which led to change 2.
+4. **12:50, chirp test on zone 1:** start, then close after a hold of 0–5 s. The controller
+   reported the zone on for 3.0–7.4 s, about 2 s more than the hold.
+5. **12:58–12:59, five-second blasts** on zones 9, 8, 7 and 6, back to back. The controller had
+   each on for 4.5–6.7 s, with no errors.
+6. **13:04, change 2 deployed.**
+7. **13:11, timing test:** 4 cycles, one after 90 s idle. The valve state was current after every
+   start and close.
+8. **13:10–14:32, three blowout runs** with my script: 10 s and 60 s blasts, and 10.5-minute gaps
+   between blasts. All 8 starts and 5 stops worked first time ([E2](#e2-command-times)).
+9. **Since 13:11:** the controller has stayed connected, with no read timing out, through 14:31
+   (Home Assistant's history of its Connected and Consecutive timeouts sensors).
 
-Hubs (`BH1-0001`) are filtered out at discovery — they don't actuate
-anything, so they don't appear in the device picker or the device
-registry.
+Seen and not investigated: after each Home Assistant restart, the first read timed out (12:25:32
+and 13:05:13). The controller showed as disconnected until the next read: 16 s the first time,
+6 minutes the second.
 
-## Services
+## State of play
 
-- `orbit_bhyve.start_watering` — `entity_id` + optional `duration` (sec)
-- `orbit_bhyve.stop_all` — stop everything on the targeted device
-- `orbit_bhyve.refresh_devices` — re-query the cloud (for new devices, key
-  rotation, or fw changes) and **merge** the result: adds new devices, keeps
-  devices you excluded excluded, and never overwrites a working network key or
-  mesh ID with a blank one. Optional `config_entry_id` targets one account;
-  omit it to refresh all. Manual, no background polling. For a UI equivalent
-  with a device picker, use **Reconfigure** (below)
-- `orbit_bhyve.get_program` — read back a program slot (A–F) as structured
-  data (`SupportsResponse.ONLY`): days, start times, per-zone durations
-- `orbit_bhyve.set_program` — store/replace a program in a slot: watering
-  days (weekdays / even / odd / every-N-days), start time(s), per-zone
-  run durations. Optionally enable it in the same call
-- `orbit_bhyve.delete_program` — clear a program slot
+- **Running:** on my controller since 2026-11-18.
+- **Not proven:**
+  - a connection held for days;
+  - the cost of keeping one of the Bluetooth proxy's connection slots permanently;
+  - any other controller.
 
-> **Watering programs are for non-Smart slots.** The device stores up to six
-> program slots; this integration reads and writes their schedules over BLE.
-> Slots are read back from the device's `#10` sync dump (a multi-frame reply
-> reassembled over the connection), so `get_program` and the Program sensors
-> reflect what's actually stored — including programs created in the B-Hyve
-> app. For richer scheduling logic, drive `start_watering` from
-> `irrigation_unlimited` or HA's Smart Irrigation instead.
+  The hose timers get change 1's stricter desync check, untested here.
+- **Known gap:** one other failure path still disconnects in the middle of a read, the
+  decrypt-failure branch at
+  [`connection.py:434`](https://github.com/kydonian/orbit-bhyve-ble/blob/05f47e8d3aff3364e0b0ec5cc54937d75ac53a51/custom_components/orbit_bhyve/connection.py#L434).
+  That's
+  [ljmerza/orbit-bhyve-ble#72](https://github.com/ljmerza/orbit-bhyve-ble/issues/72).
+- **Upstream:** not proposed. Change 2 alone, rebuilt on ljmerza's `main`, is on branch
+  `fix/valve-confirmed-state`.
+- **Issues:** off on this fork.
 
-## Options flow
+## Using it
 
-- **Default watering duration** (sec) — used when `start_watering` is called
-  without an explicit duration
-- **Disconnect after idle** (sec) — pooled BLE connection closes after this
-  many seconds idle to free the proxy slot
-- **Polling interval — idle** (sec) — how often to refresh state when no
-  station is watering
-- **Polling interval — watering** (sec) — faster polling while a station is
-  active
-- **Flow calibration** (counts per gallon) — converts the **Gen2** flow
-  counter to gallons; default 433 was bucket-measured. Re-calibrate by
-  comparing `Water used` against a bucket/meter over one run. This option
-  does nothing on Gen1 HT25 timers: those calibrate per device via the **Flow
-  calibration** *number entity*, in counts per **litre** — see "What you get"
-  above
-- **Mesh live status poll** (bool, default off) — HT25 mesh timers connect
-  over BLE on each idle poll to read live watering state and battery.
-  Battery trade-off: ~96 connects/day at the default idle cadence
+Copy `custom_components/orbit_bhyve/` from branch `wt25g2` into Home Assistant's
+`/config/custom_components/` and restart Home Assistant. There are no releases, and it isn't set up
+for HACS.
 
-## Reconfigure (adding a device you bought later)
+## Evidence
 
-The device list is captured in the config entry at setup and is **not**
-refreshed by a reload or an HA restart, so a newly-purchased timer won't appear
-on its own. Adding the account a second time doesn't work either — the entry is
-keyed on your email, so the flow aborts with "already configured".
+`d1e861e` below is pete-jorgensen's code before these changes, and `05f47e8` is this fork's code
+with them.
 
-Settings → Devices & Services → Orbit B-Hyve BLE → ⋮ → **Reconfigure**:
+### E1. WT25G2 support isn't upstream
 
-1. Re-runs cloud discovery with the saved credentials. You're only prompted for
-   a password if Orbit rejects them
-2. Re-shows the device picker. **New devices are pre-checked**; devices you
-   excluded before stay unchecked
-3. Devices the cloud no longer returns are labelled *"no longer on the Orbit
-   account"* and stay pre-checked — they keep working over BLE. Uncheck one to
-   remove it and its entities. This is deliberate: cloud discovery skips
-   anything missing a `mesh_id`, so a partial response must not silently delete
-   a working device
-4. Submitting updates the entry and reloads it
+pete-jorgensen opened it as
+[ljmerza/orbit-bhyve-ble#73](https://github.com/ljmerza/orbit-bhyve-ble/pull/73) and closed it on
+2026-11-07:
 
-Two things worth knowing:
+> Closing this for now so you have one PR from me to review at a time; sorry for the noise. WT25
+> support will come back after #70 and the disconnect fix, rebased so it carries only the WT25
+> changes.
 
-- The **first** reconfigure of an entry created before this feature existed may
-  show previously-excluded devices as checked, because the old entry never
-  recorded which ones you excluded. Uncheck them once and the choice sticks.
-- Re-discovery never overwrites a working `network_key` or `hub_mesh_device_id`
-  with a blank cloud value. This matters if you rely on **Hub mesh ID
-  overrides** — a partial `/networks` response would otherwise drop the device
-  back to the `0x0000` placeholder and your watering commands would start
-  getting dropped with only a log warning to show for it.
+### E2. Command times
 
-## How it works
+These are the Home Assistant service-call durations my blowout script logged, in seconds; ✗
+marks a call that failed with HTTP 500.
 
-1. **Setup**: log into Orbit cloud at setup — and again only when you
-   reconfigure or call `refresh_devices` → fetch device list → fetch one AES
-   network key per mesh → cache everything in the config entry
-2. **Per command**: the integration's pooled BLE connection (one per device)
-   does an AES handshake, runs the model-specific init sequence on first
-   connect, then sends one encrypted frame per command and reads back
-   notifications
-3. **Reuse**: the connection stays open across commands until idle timeout.
-   Watering commands re-run the model init/bind first — the device silently
-   ignores a watering frame sent on a stale bind — while reads reuse the
-   pooled session directly. Marginal proxy links get a bounded handshake with
-   a few clean retries instead of a wedged connection.
+Before (pete-jorgensen's code):
+- **Starts, 2026-11-17:** 8.7, 13.7, 17.7.
+- **Starts, 2026-11-18:** 22.7, 11.7✗, 3.8✗, 11.0, 2.9✗, 10.6, 12.8✗, 22.7, 28.9, 12.8✗, 10.9,
+  8.4, 5.5, 13.6, 5.5, 14.5, 10.8, 5.5, 17.5, 16.8.
+- **Stops (`stop_all`), 2026-11-17:** 22.8, 7.9, 10.4, 24.3.
 
-The cipher (AES-128-ECB used as a CTR-style keystream, frame trailer =
-`sum(plaintext) + magic + len`) was reverse-engineered against captured
-phone-app traffic. Different hardware families (HT25 vs HT34A) use different
-inner plaintext formats and different magic bytes; the per-model device
-classes encode that. Adding a new model = drop a `devices/htXX.py` and
-register it.
+After (this fork), 2026-11-18:
+- **Starts:** 2.1, 2.1, 2.2, 2.1, 2.1, 2.2, 2.1, 2.1.
+- **Stops:** 4.1, 3.5, 4.2, 4.1, 4.1.
 
-## Credits
+### E3. The desync check fired on good frames and broke commands
 
-The marginal-link connection hardening (bounded handshake + retry, capped
-write-ack), the per-command re-bind for HT25 actuation, the RSSI and
-connectivity/watering sensors, and the HT34/HT34A battery + watering-status
-decode were ported from
-[@stuartdenne](https://github.com/stuartdenne/ha-orbit-bhyve-ble-old)'s fork.
+Each of the 5 failed starts came within a second of a desync warning, at 11:08:26, 11:08:32,
+11:22:03, 11:28:11 and 11:52:47. The one at 11:28:11 failed in the integration's own write, 30 ms
+after the warning:
 
-## Legal & ethical notice
+```
+# Home Assistant core log, 2026-11-18: a start that failed (trimmed)
+11:28:11.133 WARNING [custom_components.orbit_bhyve.connection] 44:67:55:0A:5F:D0: CTR desync detected (bad header 3a34362d) — scheduling disconnect to self-heal
+11:28:11.163 ERROR [aiohttp.server] Error handling request from 192.168.1.106
+  File "/config/custom_components/orbit_bhyve/devices/protobuf.py", line 515, in start_watering
+  File "/config/custom_components/orbit_bhyve/connection.py", line 658, in send
+  File "/config/custom_components/orbit_bhyve/connection.py", line 613, in _write_frame
+bleak.exc.BleakError: Peripheral 44:67:55:1A:5F:D0 changed connection status while waiting for BluetoothGATTWriteResponse
+```
 
-This project documents the protocol of a device the project authors
-lawfully purchased and own. Reverse engineering for the purpose of
-interoperability with hardware you own is protected in the United States
-under 17 U.S.C. §1201(f). The protocol descriptions in this repository
-were reconstructed from observation of the device's wire-level BLE traffic
-and from analysis techniques applied to the publicly distributed companion
-mobile application. The authors are not affiliated with Orbit Irrigation
-Products Inc.
+That disconnect comes from
+[`connection.py:380–390` at `d1e861e`](https://github.com/pete-jorgensen/orbit-bhyve-ble/blob/d1e861e1726e94a7c2b33ba3d81dca0bd6246a5e/custom_components/orbit_bhyve/connection.py#L380-L390).
+When the first frame of an exchange lacks the expected header, it schedules a disconnect,
+without waiting for the command being written.
 
-[MIT](LICENSE).
+The frames it flagged were fine. Home Assistant's log has 108 such warnings from 2026-11-15
+12:58 to 2026-11-18 11:52, and 87 of their "bad headers" are plain text:
+
+| "Bad header" | As text | Times |
+|---|---|---|
+| `32303236` | `2026` | 21 |
+| `3a35342d`, `3a31352d`, … | `:54-`, `:15-`, … | 66 |
+| `0800221d`, `10880e50`, … | not text | 21 |
+
+These are pieces of the timestamps in the controller's status messages, which
+[pete-jorgensen's notes](https://github.com/pete-jorgensen/orbit-bhyve-ble/blob/d1e861e1726e94a7c2b33ba3d81dca0bd6246a5e/custom_components/orbit_bhyve/devices/wt25g2.py#L19-L23)
+say the later frames carry. A frame that decrypted wrongly would be random bytes, not text, so
+the decryption was in step. After change 1, the debug log at 12:30:27 shows the same kind of
+frame decrypting to `2026-11-18T12:30` and being ignored. There have been no desync warnings since the change was
+deployed at 12:24.
+
+### E4. The valve state lagged by up to 10 s
+
+After a confirmed start or close, the valve called `async_request_refresh()`
+([`valve.py:97` and `:101` at `d1e861e`](https://github.com/pete-jorgensen/orbit-bhyve-ble/blob/d1e861e1726e94a7c2b33ba3d81dca0bd6246a5e/custom_components/orbit_bhyve/valve.py#L97-L101)).
+Home Assistant debounces that with a 10 s cooldown
+([`REQUEST_REFRESH_DEFAULT_COOLDOWN = 10`](https://github.com/home-assistant/core/blob/dev/homeassistant/helpers/update_coordinator.py)):
+within the cooldown the call returns at once and the entities update when it ends.
+
+Measured:
+- **Before change 2 (12:30 test):** right after the call, Home Assistant showed the valve closed
+  after 5 of 7 starts, and watering after 5 of 7 closes, though the integration's debug log had
+  the controller confirm each within about 2 s.
+- **After change 2 (13:11 test):** the state was current after 4 of 4 starts and 4 of 4 closes.
+
+### E5. A connection per command
+
+At `d1e861e`, every operation in
+[`devices/protobuf.py`](https://github.com/pete-jorgensen/orbit-bhyve-ble/blob/d1e861e1726e94a7c2b33ba3d81dca0bd6246a5e/custom_components/orbit_bhyve/devices/protobuf.py#L541-L545)
+ends with `finally: await self.connection.disconnect()`. That covers start at line 545, stop at
+582, the status read at 500, and others. An idle timer closes anything left open after 60 s.
+
+### E6. Only the WT25G2 keeps its connection
+
+- pete-jorgensen's notes call the WT25G2 Orbit's mains-powered controller
+  ([`wt25g2.py:4`](https://github.com/pete-jorgensen/orbit-bhyve-ble/blob/d1e861e1726e94a7c2b33ba3d81dca0bd6246a5e/custom_components/orbit_bhyve/devices/wt25g2.py#L4)).
+- In this fork, keeping the connection is off by default
+  ([`protobuf.py:283`](https://github.com/kydonian/orbit-bhyve-ble/blob/05f47e8d3aff3364e0b0ec5cc54937d75ac53a51/custom_components/orbit_bhyve/devices/protobuf.py#L283)),
+  and only the WT25G2 turns it on
+  ([`wt25g2.py:46`](https://github.com/kydonian/orbit-bhyve-ble/blob/05f47e8d3aff3364e0b0ec5cc54937d75ac53a51/custom_components/orbit_bhyve/devices/wt25g2.py#L46)).
