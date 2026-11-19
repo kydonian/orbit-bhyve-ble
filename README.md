@@ -1,3 +1,7 @@
+# Authors note
+
+This is all 100% vibe-coded and unreviewed. The AI found your integrations and got it working on my hardware, I told it to record anything that might be helpful to the original author's. Presented for what it is, just in case it's useful.
+
 # orbit-bhyve-ble, for the B-hyve WT25G2 sprinkler controller
 
 **The integration's documentation is at [ljmerza/orbit-bhyve-ble](https://github.com/ljmerza/orbit-bhyve-ble)**,
