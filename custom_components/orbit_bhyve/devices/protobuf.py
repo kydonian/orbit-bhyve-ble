@@ -275,6 +275,21 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
     # connection's CTR-desync self-heal (mesh classes leave this None).
     reply_header = b"\xaa\x77\x5a\x0f"
     log_label = "protobuf"
+    # Keep the BLE session open between operations instead of closing it after
+    # each one. Off for the battery valves: they hold ONE session, so a held link
+    # locks the vendor app out, and every connected minute costs their AA cells.
+    # A model that turns it on gets a session that is reopened only when the link
+    # drops or the connection layer finds the CTR stream broken.
+    keep_connected: bool = False
+
+    async def _end_session(self) -> None:
+        """The end of every public operation: close the link, unless this model
+        keeps it open (`keep_connected`)."""
+        if self.connection is None:
+            return
+        if self.keep_connected and self.connection.is_connected:
+            return
+        await self.connection.disconnect()
 
     def _observe_plaintext(self, pt: bytes) -> None:
         # Protobuf-family status decode (live battery + real watering state),
@@ -497,7 +512,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                         self.mac, self.log_label, self.state.consecutive_timeouts, err
                     )
                 finally:
-                    await self.connection.disconnect()
+                    await self._end_session()
             return self.state
 
     async def start_watering(self, station: int, duration_sec: int) -> bool:
@@ -542,7 +557,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 )
                 return False
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     async def stop_watering(self, station: int | None = None) -> bool:
         async with self._api_lock:
@@ -579,7 +594,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 )
                 return False
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     async def set_rain_delay(self, minutes: int) -> bool:
         """Set the rain delay to `minutes` (0 clears). Returns True once the
@@ -625,7 +640,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 )
                 return ok
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     async def clear_rain_delay(self) -> bool:
         """Clear the rain delay (#17{#1=0}). Returns True once #16.#13 reads off."""
@@ -650,8 +665,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             await self.refresh_status()
             return self._status_parsed and not self.state.rain_delay_minutes
         finally:
-            if self.connection is not None:
-                await self.connection.disconnect()
+            await self._end_session()
 
     # ─── Watering programs (#19 / #20 / #14 / #10) ────────────────────────────
     #
@@ -715,7 +729,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 await self._read_programs()
                 return dict(self.state.programs)
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     def _enable_mask(self, mask: int | None) -> int:
         """The current #20 enable bitmask to base a write on. A program read can
@@ -785,7 +799,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 )
                 return ok
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     @_ble_write_guard
     async def delete_program(self, slot: int) -> bool:
@@ -807,7 +821,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 sch = programs.get(slot)
                 return sch is None or sch.empty
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     @_ble_write_guard
     async def set_program_enabled(self, slot: int, on: bool) -> bool:
@@ -843,7 +857,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 # unverified toggle as unconfirmed instead — the safe direction.
                 return bool(self._enable_mask(mask2) & bit) == on
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     @_ble_write_guard
     async def set_controller_mode(self, on: bool) -> bool:
@@ -861,7 +875,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 await self.refresh_status()
                 return self.state.controller_mode == mode
             finally:
-                await self.connection.disconnect()
+                await self._end_session()
 
     @_ble_write_guard
     async def identify(self, seconds: int = 6) -> bool:
@@ -879,4 +893,4 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 await self.connection.send(_build_message(_build_identify_pb(0)))
                 return True
             finally:
-                await self.connection.disconnect()
+                await self._end_session()

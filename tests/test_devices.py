@@ -1391,7 +1391,7 @@ def test_open_falls_back_to_the_advertised_name_and_caches_it(monkeypatch):
                             {"44:67:55:1A:1B:2C": device})
     reached = {}
 
-    async def _stop_at_connect(cls, ble_device, name, max_attempts=3):
+    async def _stop_at_connect(cls, ble_device, name, max_attempts=3, **_kwargs):
         reached["device"] = ble_device
         raise RuntimeError("far enough")
 
@@ -1635,3 +1635,58 @@ def test_reassembled_status_actually_parses():
     assert dev._status_parsed is True
     assert dev.state.is_watering is False
 
+
+# --- held session (keep_connected / keep_alive) ------------------------------
+
+def test_only_the_mains_powered_controller_keeps_its_session():
+    """The battery valves hold ONE session and pay for every connected minute, so only
+    the WT25G2 keeps the link open between operations."""
+    from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
+    assert BHyveWT25G2Device.keep_connected is True
+    assert BHyveProtobufDevice.keep_connected is False
+
+
+def test_end_session_keeps_a_live_link_only_for_keep_connected():
+    for keep, survives in ((True, True), (False, False)):
+        dev = types.SimpleNamespace(keep_connected=keep, connection=_conn(23))
+        from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
+        asyncio.run(BHyveProtobufDevice._end_session(dev))
+        assert (dev.connection._client is not None) is survives
+
+
+def test_a_held_session_is_never_closed_for_idleness():
+    c = _conn(23)
+    c._idle_sec = 60
+    c.keep_alive = True
+    c._arm_idle_timer()
+    assert c._idle_timer is None
+
+
+def test_a_lost_link_marks_only_its_own_session_dead():
+    c = _conn(23)
+    c._handshaken, c._session_gen = True, 2
+    c._on_link_lost(1)                       # a callback from an earlier link
+    assert c._handshaken
+    c._on_link_lost(2)
+    assert not c._handshaken
+
+
+def test_a_dead_held_link_is_reopened_once_and_the_exchange_rerun(monkeypatch):
+    from bleak.exc import BleakError
+    c = _conn(23)
+    c._handshaken = True
+    opened, runs = [], []
+
+    async def ensure_connected():
+        if not c._handshaken:
+            c._client, c._handshaken = _FakeClient(23), True
+            opened.append(1)
+    monkeypatch.setattr(c, "ensure_connected", ensure_connected)
+
+    async def exchange():
+        runs.append(1)
+        if len(runs) == 1:
+            raise BleakError("Not connected")
+        return "reply"
+    assert asyncio.run(c._on_live_session(exchange)) == "reply"
+    assert len(opened) == 1 and len(runs) == 2
